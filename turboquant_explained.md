@@ -81,9 +81,9 @@ So TurboQuant is within a factor of **2.72× of the theoretical best possible qu
 
 ---
 
-## Experimental Results
+## Experimental Results (Paper)
 
-All tests on Llama-3.1-8B-Instruct:
+All paper results on Llama-3.1-8B-Instruct. Our reproduction runs on Llama-3.2-3B-Instruct (RTX 5070 12GB) — see [README](README.md) for our benchmark numbers.
 
 ### KV Cache Compression (Needle-in-a-Haystack)
 | Method | Recall Score | Compression |

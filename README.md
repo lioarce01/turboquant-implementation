@@ -33,7 +33,7 @@ results/               # Comparison reports and plots
 
 ---
 
-## Benchmark results — RTX 5070 12GB / Qwen2.5-1.5B-Instruct
+## Benchmark results — RTX 5070 12GB / Llama-3.2-3B-Instruct
 
 ![Benchmark comparison](results/benchmark_comparison.png)
 
@@ -45,7 +45,7 @@ results/               # Comparison reports and plots
 
 > **Llama 3.2 requires a HuggingFace token.** Accept the license at
 > [huggingface.co/meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)
-> then set your token before running: `set HF_TOKEN=hf_your_token_here`
+> then set your token before running: `export HF_TOKEN=hf_your_token_here`
 
 ```bash
 pip install -r requirements.txt
