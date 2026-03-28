@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Benchmark outputs
+logs/
+
+# Keep the latest comparison plot, ignore timestamped ones and reports
+results/comparison_*.png
+results/comparison_*.md
+!results/benchmark_comparison.png
+
+# HuggingFace model cache (don't commit downloaded models)
+*.safetensors
+*.bin
+*.gguf
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Secrets
+*.env
+hf-token.md
+*token*.md
+*secret*.md
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
