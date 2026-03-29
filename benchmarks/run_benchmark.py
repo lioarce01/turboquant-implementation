@@ -2,18 +2,46 @@
 TurboQuant Benchmark Runner
 Runs baseline or TurboQuant-compressed inference and logs results.
 
+Benchmark design rationale
+---------------------------
+TurboQuant compresses the *stored* KV cache — it does not reduce memory during
+the prefill (prompt processing) phase.  During prefill each attention layer
+must materialise the full Q @ Kᵀ attention matrix, which is O(seq²) and
+independent of whether the cache is compressed.
+
+On a 12 GB GPU (e.g. RTX 5070) the prefill of an 8 192-token prompt already
+exceeds VRAM and spills into system RAM, making the baseline and the
+compressed run equally slow and memory-heavy.  That comparison tells us
+nothing about what the paper claims.
+
+The correct setup is:
+  - Prefill context ≤ 4 096 tokens (fits cleanly in 12 GB).
+  - Generate 512+ new tokens so the accumulated KV cache grows large enough
+    that compression matters.
+  - Measure *end-of-generation* VRAM (model weights + KV cache, activations
+    freed) to see the actual savings, in addition to peak VRAM.
+
+Tests
+-----
+  needle      Needle-in-a-haystack: verifies quality is preserved.
+  speed       Long-decode throughput and KV cache memory at various context
+              lengths + generation lengths.
+  perplexity  WikiText-2 perplexity: language-quality reference.
+
 Usage:
     # Baseline (no quantization, full fp16 KV cache):
     python benchmarks/run_benchmark.py --mode baseline --test needle
 
     # TurboQuant with 4-bit compression:
-    python benchmarks/run_benchmark.py --mode turboquant --bits 4 --test needle
-
-    # Full benchmark suite:
     python benchmarks/run_benchmark.py --mode turboquant --bits 4 --test all
 
+    # Full benchmark suite:
+    python benchmarks/run_benchmark.py --mode turboquant --bits 4 --test all \\
+        --context_lengths 512 1024 2048 4096 --n_decode_tokens 512
+
     # Quick smoke test:
-    python benchmarks/run_benchmark.py --mode baseline --test speed --context_lengths 512
+    python benchmarks/run_benchmark.py --mode baseline --test speed \\
+        --context_lengths 512 --n_decode_tokens 64
 """
 
 import sys
@@ -24,6 +52,7 @@ import argparse
 import random
 import datetime
 import math
+from typing import Tuple, List
 
 import torch
 import numpy as np
@@ -62,12 +91,14 @@ def load_model(device: str = "cuda"):
 # ---------------------------------------------------------------------------
 
 def get_vram_gb() -> float:
+    """Current allocated VRAM — use after generation to read KV cache + model footprint."""
     if torch.cuda.is_available():
         return torch.cuda.memory_allocated() / 1e9
     return 0.0
 
 
 def get_peak_vram_gb() -> float:
+    """Peak VRAM since last reset — dominated by prefill activations."""
     if torch.cuda.is_available():
         return torch.cuda.max_memory_allocated() / 1e9
     return 0.0
@@ -144,7 +175,13 @@ def run_needle_test(
     bits: int = 4,
     device: str = "cuda",
 ) -> list:
-    """Run needle-in-a-haystack tests at various context lengths."""
+    """
+    Needle-in-a-haystack: measures accuracy at retrieving a hidden code from a
+    long context.  Validates that TurboQuant compression does not hurt recall.
+
+    Uses max_new_tokens=20 since the answer is a short code — this test is
+    purely about quality, not decode speed.
+    """
     from src.kv_cache_hook import run_with_cache
 
     results = []
@@ -215,30 +252,51 @@ def run_needle_test(
 
 
 # ---------------------------------------------------------------------------
-# Speed & memory test
+# Speed & KV cache memory test
 # ---------------------------------------------------------------------------
 
 def run_speed_test(
     model,
     tokenizer,
     context_lengths: list,
-    n_new_tokens: int = 128,
+    n_decode_tokens: int = 512,
     n_repeats: int = 5,
     use_turboquant: bool = False,
     bits: int = 4,
     device: str = "cuda",
 ) -> list:
-    """Measure inference speed and VRAM at different context lengths."""
+    """
+    Measures decode throughput and KV cache memory footprint.
+
+    Each run:
+      1. Prefill: process a fixed-length prompt (context_length tokens).
+      2. Decode: generate n_decode_tokens new tokens autoregressively.
+
+    The KV cache grows to (context_length + n_decode_tokens) slots by the end.
+    With n_decode_tokens=512 the cache is large enough to show meaningful
+    savings between fp16 baseline and TurboQuant-compressed runs.
+
+    Metrics reported:
+      avg_peak_vram_gb  — peak during prefill (similar for both modes; dominated
+                          by attention activations, not KV storage)
+      avg_end_vram_gb   — VRAM after generation completes: model weights + KV
+                          cache only (activations freed).  This is where
+                          TurboQuant shows its memory savings.
+      avg_kv_cache_gb   — exact size of the compressed cache tensor.
+      avg_tokens_per_sec — overall throughput (prefill + decode).
+      avg_decode_tps    — decode-only throughput (approximated as
+                          n_decode_tokens / (total_ms - prefill_ms)).
+    """
     from src.kv_cache_hook import run_with_cache
 
-    # Fixed prompt prefix
+    # Fixed prompt prefix long enough to fill any requested context_length
     base_prompt = "The following is a detailed analysis of " + (" ".join(FILLER_SENTENCES * 100))
 
     results = []
     for ctx_len in context_lengths:
-        print(f"\n  [Speed] Context length: {ctx_len} tokens")
+        print(f"\n  [Speed] Prefill: {ctx_len} tokens | Decode: {n_decode_tokens} new tokens")
 
-        # Tokenize to exact length
+        # Tokenize to exact context_length
         inputs = tokenizer(
             base_prompt, return_tensors="pt", truncation=True, max_length=ctx_len
         ).to(device)
@@ -246,52 +304,86 @@ def run_speed_test(
 
         times = []
         tps_list = []
-        vrams = []
+        decode_tps_list = []
+        peak_vrams = []
+        end_vrams = []
         kv_sizes = []
+
+        # Measure prefill time once (same for baseline and TQ since both do
+        # full attention over the prompt).
+        prefill_ms_samples = []
 
         for rep in range(n_repeats):
             try:
+                # --- prefill timing (forward pass only, no decode) ---
                 reset_peak_vram()
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                torch.cuda.synchronize()
+                t_pre = time.perf_counter()
+                with torch.no_grad():
+                    _ = model(inputs["input_ids"])
+                torch.cuda.synchronize()
+                prefill_ms = (time.perf_counter() - t_pre) * 1000
+                prefill_ms_samples.append(prefill_ms)
+
+                # --- full generation (prefill + decode) ---
+                reset_peak_vram()
+                torch.cuda.synchronize()
 
                 output_ids, cache, timing = run_with_cache(
                     model,
                     inputs["input_ids"],
                     attention_mask=inputs.get("attention_mask"),
-                    max_new_tokens=n_new_tokens,
+                    max_new_tokens=n_decode_tokens,
                     use_turboquant=use_turboquant,
                     bits=bits,
                     do_sample=False,
                     temperature=1.0,
                 )
 
-                torch.cuda.synchronize() if torch.cuda.is_available() else None
+                torch.cuda.synchronize()
+                end_vram = get_vram_gb()   # model weights + KV cache; activations freed
+                peak_vram = get_peak_vram_gb()
 
-                times.append(timing["total_ms"])
+                total_ms = timing["total_ms"]
+                decode_ms = max(total_ms - prefill_ms, 1.0)
+                decode_tps = n_decode_tokens / (decode_ms / 1000)
+
+                times.append(total_ms)
                 tps_list.append(timing["tokens_per_sec"])
-                vrams.append(get_peak_vram_gb())
+                decode_tps_list.append(decode_tps)
+                peak_vrams.append(peak_vram)
+                end_vrams.append(end_vram)
                 if cache is not None:
                     kv_sizes.append(cache.vram_usage_bytes() / 1e9)
+
+                print(f"    Rep {rep+1}/{n_repeats}: {actual_len}+{n_decode_tokens} tok | "
+                      f"{total_ms:.0f}ms total | "
+                      f"peak {peak_vram:.2f}GB | end {end_vram:.2f}GB VRAM")
 
             except torch.cuda.OutOfMemoryError:
                 print(f"    OOM at context {ctx_len} — skipping")
                 break
 
         if times:
+            avg_prefill_ms = round(sum(prefill_ms_samples) / len(prefill_ms_samples), 1)
             result = {
                 "test": "speed",
                 "context_length": actual_len,
-                "n_new_tokens": n_new_tokens,
+                "n_decode_tokens": n_decode_tokens,
                 "n_repeats": len(times),
                 "avg_total_ms": round(sum(times) / len(times), 1),
+                "avg_prefill_ms": avg_prefill_ms,
                 "avg_tokens_per_sec": round(sum(tps_list) / len(tps_list), 1),
-                "avg_peak_vram_gb": round(sum(vrams) / len(vrams), 3),
+                "avg_decode_tps": round(sum(decode_tps_list) / len(decode_tps_list), 1),
+                "avg_peak_vram_gb": round(sum(peak_vrams) / len(peak_vrams), 3),
+                "avg_end_vram_gb": round(sum(end_vrams) / len(end_vrams), 3),
                 "avg_kv_cache_gb": round(sum(kv_sizes) / len(kv_sizes), 4) if kv_sizes else None,
             }
             results.append(result)
-            print(f"    → {result['avg_tokens_per_sec']} tok/s | "
-                  f"VRAM: {result['avg_peak_vram_gb']:.2f}GB | "
-                  f"KV: {result['avg_kv_cache_gb']}GB")
+            print(f"    → decode {result['avg_decode_tps']} tok/s | "
+                  f"peak VRAM {result['avg_peak_vram_gb']:.2f}GB | "
+                  f"end VRAM {result['avg_end_vram_gb']:.2f}GB | "
+                  f"KV {result['avg_kv_cache_gb']}GB")
 
     return results
 
@@ -327,7 +419,6 @@ def run_perplexity_test(
         print(f"\n  [Perplexity] Context length: {ctx_len} tokens")
 
         nlls = []
-        # Stride through the text
         stride = ctx_len // 2
         start_positions = list(range(0, min(len(all_tokens) - ctx_len, n_samples * stride), stride))[:n_samples]
 
@@ -339,7 +430,7 @@ def run_perplexity_test(
             try:
                 with torch.no_grad():
                     if use_turboquant:
-                        from src.kv_cache_hook import TurboQuantCache, apply_turboquant_to_model
+                        from src.kv_cache_hook import apply_turboquant_to_model
                         cache = apply_turboquant_to_model(model, bits=bits, verbose=False)
                         outputs = model(input_ids, past_key_values=cache, use_cache=True, labels=input_ids)
                     else:
@@ -377,7 +468,10 @@ def run_perplexity_test(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="TurboQuant Benchmark")
+    parser = argparse.ArgumentParser(
+        description="TurboQuant Benchmark",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--mode", choices=["baseline", "turboquant"], default="baseline",
                         help="baseline = full fp16 KV cache; turboquant = compressed KV cache")
     parser.add_argument("--bits", type=int, default=4, choices=[2, 3, 4, 8],
@@ -385,12 +479,19 @@ def main():
     parser.add_argument("--test", default="all", choices=["all", "needle", "speed", "perplexity"],
                         help="Which test(s) to run")
     parser.add_argument("--context_lengths", type=int, nargs="+",
-                        default=[512, 1024, 2048, 4096, 8192],
-                        help="Context lengths to benchmark")
+                        default=[512, 1024, 2048, 4096],
+                        help="Prefill context lengths to benchmark. "
+                             "8192 is intentionally excluded: at that length "
+                             "prefill activations overflow 12 GB VRAM and the "
+                             "comparison no longer reflects KV cache compression.")
     parser.add_argument("--n_trials", type=int, default=20,
                         help="Number of trials for needle test")
     parser.add_argument("--n_repeats", type=int, default=5,
                         help="Repeats for speed test")
+    parser.add_argument("--n_decode_tokens", type=int, default=512,
+                        help="New tokens to generate in the speed test. "
+                             "512+ lets the KV cache grow large enough to show "
+                             "meaningful memory savings from compression.")
     parser.add_argument("--device", default="cuda",
                         help="Device (cuda or cpu)")
     parser.add_argument("--output_log", type=str, default=None,
@@ -412,6 +513,7 @@ def main():
     print(f"  Mode: {args.mode.upper()}" + (f" ({args.bits}-bit)" if use_turboquant else ""))
     print(f"  Tests: {args.test}")
     print(f"  Context lengths: {args.context_lengths}")
+    print(f"  Decode tokens (speed test): {args.n_decode_tokens}")
     print(f"  Output: {args.output_log}")
     print(f"{'='*60}\n")
 
@@ -430,6 +532,7 @@ def main():
             "gpu": gpu_name,
             "gpu_total_gb": round(gpu_total_gb, 1),
             "context_lengths": args.context_lengths,
+            "n_decode_tokens": args.n_decode_tokens,
         },
         "results": [],
         "summary": {},
@@ -448,9 +551,10 @@ def main():
         all_results.extend(needle_results)
 
     if args.test in ("speed", "all"):
-        print("\n[TEST 2/3] Speed & Memory")
+        print("\n[TEST 2/3] Speed & KV Cache Memory")
         speed_results = run_speed_test(
             model, tokenizer, args.context_lengths,
+            n_decode_tokens=args.n_decode_tokens,
             n_repeats=args.n_repeats,
             use_turboquant=use_turboquant, bits=args.bits, device=args.device,
         )
@@ -468,16 +572,16 @@ def main():
 
     # Build summary
     needle_accs = [r["accuracy"] for r in all_results if r["test"] == "needle"]
-    speed_tps = [r["avg_tokens_per_sec"] for r in all_results if r["test"] == "speed"]
+    speed_tps = [r["avg_decode_tps"] for r in all_results if r["test"] == "speed"]
     ppls = [r["perplexity"] for r in all_results if r["test"] == "perplexity"]
-    vrams = [r["avg_peak_vram_gb"] for r in all_results if "avg_peak_vram_gb" in r and r["avg_peak_vram_gb"]]
+    end_vrams = [r["avg_end_vram_gb"] for r in all_results if r["test"] == "speed" and r.get("avg_end_vram_gb")]
     kv_sizes = [r["avg_kv_cache_gb"] for r in all_results if r.get("avg_kv_cache_gb")]
 
     log["summary"] = {
         "avg_needle_accuracy": round(sum(needle_accs) / len(needle_accs), 4) if needle_accs else None,
-        "avg_tokens_per_sec": round(sum(speed_tps) / len(speed_tps), 1) if speed_tps else None,
+        "avg_decode_tps": round(sum(speed_tps) / len(speed_tps), 1) if speed_tps else None,
         "avg_perplexity": round(sum(ppls) / len(ppls), 2) if ppls else None,
-        "avg_peak_vram_gb": round(sum(vrams) / len(vrams), 3) if vrams else None,
+        "avg_end_vram_gb": round(sum(end_vrams) / len(end_vrams), 3) if end_vrams else None,
         "avg_kv_cache_gb": round(sum(kv_sizes) / len(kv_sizes), 4) if kv_sizes else None,
     }
 
@@ -494,9 +598,6 @@ def main():
             print(f"    {k}: {v}")
     print(f"{'='*60}\n")
 
-
-# Fix missing import
-from typing import Tuple
 
 if __name__ == "__main__":
     main()

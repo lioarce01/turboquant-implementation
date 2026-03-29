@@ -12,7 +12,24 @@ For a plain-English explanation of the paper see [`turboquant_explained.md`](tur
 
 ## What we're implementing
 
-TurboQuant compresses the KV cache 4× during LLM inference with near-zero quality loss. Core idea: apply a random rotation to KV vectors so their coordinates become approximately Gaussian, then use a precomputed optimal scalar quantizer (Lloyd-Max) to store each coordinate in 3–4 bits instead of 16.
+TurboQuant compresses the **stored KV cache** 4× during LLM inference with near-zero quality loss. Core idea: apply a random rotation to KV vectors so their coordinates become approximately Gaussian, then use a precomputed optimal scalar quantizer (Lloyd-Max) to store each coordinate in 3–4 bits instead of 16.
+
+### What TurboQuant does and does not compress
+
+TurboQuant targets **KV cache storage** — the keys and values accumulated across all past tokens during autoregressive generation. It does **not** reduce the memory required for the initial prompt processing (prefill), which is dominated by O(seq²) attention activations and is independent of how the cache is stored.
+
+On a 12 GB GPU this distinction matters: an 8 192-token prefill already overflows VRAM regardless of compression method, so that length is excluded from the benchmark. The correct comparison uses prefill contexts ≤ 4 096 tokens with long generation (512+ new tokens), where the accumulated KV cache becomes the bottleneck.
+
+### Benchmark metrics
+
+| Metric | What it measures |
+|---|---|
+| `avg_peak_vram_gb` | Peak VRAM during prefill — similar for both modes |
+| `avg_end_vram_gb` | VRAM after generation: model + KV cache (activations freed) — **main savings metric** |
+| `avg_kv_cache_gb` | Exact size of the compressed cache tensor |
+| `avg_decode_tps` | Decode-phase throughput (new tokens per second) |
+| `accuracy` | Needle-in-haystack recall — quality preservation check |
+| `perplexity` | WikiText-2 perplexity — language quality reference |
 
 The benchmark runs identical tests with and without compression and compares memory, speed, and quality.
 
@@ -54,11 +71,17 @@ pip install -r requirements.txt
 python validate_turboquant.py
 
 # Run baseline (fp16 KV cache)
-python benchmarks/run_benchmark.py --mode baseline --test all
+# context_lengths ≤ 4096 (prefill fits in 12 GB); 512 decode tokens (KV cache grows)
+python benchmarks/run_benchmark.py --mode baseline --test all \
+    --context_lengths 512 1024 2048 4096 --n_decode_tokens 512
 
-# Run TurboQuant (4-bit compressed KV cache)
-python benchmarks/run_benchmark.py --mode turboquant --bits 4 --test all
+# Run TurboQuant 4-bit compressed KV cache
+python benchmarks/run_benchmark.py --mode turboquant --bits 4 --test all \
+    --context_lengths 512 1024 2048 4096 --n_decode_tokens 512
 
-# Compare results
+# Compare results — end_vram_gb shows the KV cache memory savings
 python benchmarks/compare_results.py --auto --save_plots
+
+# Or run the full pipeline in one shot:
+bash run_full_benchmark.sh
 ```

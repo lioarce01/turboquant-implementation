@@ -155,22 +155,25 @@ def compare_logs(logs: List[dict], save_plots: bool = False, output_dir: str = N
         lines.append(format_table(delta_headers, delta_rows))
 
     # ------------------------------------------------------------------
-    # Speed & Memory comparison
+    # Speed & KV Cache Memory comparison
     # ------------------------------------------------------------------
-    lines.append("\n\n## Speed & Memory Results\n")
-    lines.append("  (Higher tok/s = better; lower VRAM = better)\n")
+    lines.append("\n\n## Speed & KV Cache Memory Results\n")
+    lines.append("  Prefill context + N decode tokens.\n")
+    lines.append("  peak_vram  = during prefill (dominated by attention activations,\n"
+                 "               similar for both modes — not what TurboQuant targets).\n"
+                 "  end_vram   = after generation: model weights + KV cache only.\n"
+                 "               This is where TurboQuant shows its memory savings.\n")
 
-    speed_headers = ["Run", "Context", "Tok/s", "VRAM GB", "KV Cache GB", "KV Compression"]
+    speed_headers = ["Run", "Context", "Decode tok", "Decode tok/s", "Peak VRAM", "End VRAM", "KV Cache GB", "KV Compression"]
     speed_rows = []
 
-    # Compute compression ratios
     for log in logs:
         run_label = f"{log['config']['mode']} {log['config']['bits']}b"
         bits = log["config"]["bits"]
         for r in get_results_by_test(log, "speed"):
             ctx = r.get("context_length", "?")
+            n_dec = r.get("n_decode_tokens", r.get("n_new_tokens", "?"))
             kv_gb = r.get("avg_kv_cache_gb")
-            # Theoretical compression ratio
             if log["config"]["mode"] == "turboquant" and kv_gb:
                 ratio = f"{16/bits:.1f}x"
             elif log["config"]["mode"] == "baseline":
@@ -178,9 +181,10 @@ def compare_logs(logs: List[dict], save_plots: bool = False, output_dir: str = N
             else:
                 ratio = "N/A"
             speed_rows.append([
-                run_label, ctx,
-                f"{r.get('avg_tokens_per_sec', 'N/A')}",
+                run_label, ctx, n_dec,
+                f"{r.get('avg_decode_tps', r.get('avg_tokens_per_sec', 'N/A'))}",
                 f"{r.get('avg_peak_vram_gb', 'N/A')}",
+                f"{r.get('avg_end_vram_gb', 'N/A')}",
                 f"{kv_gb or 'N/A'}",
                 ratio,
             ])
@@ -226,12 +230,12 @@ def compare_logs(logs: List[dict], save_plots: bool = False, output_dir: str = N
         lines.append(f"  {run_label}:")
         if s.get("avg_needle_accuracy") is not None:
             lines.append(f"    Needle accuracy:  {s['avg_needle_accuracy']*100:.1f}%")
-        if s.get("avg_tokens_per_sec") is not None:
-            lines.append(f"    Tokens/sec:       {s['avg_tokens_per_sec']}")
+        if s.get("avg_decode_tps") is not None:
+            lines.append(f"    Decode tok/s:     {s['avg_decode_tps']}")
         if s.get("avg_perplexity") is not None:
             lines.append(f"    Avg perplexity:   {s['avg_perplexity']}")
-        if s.get("avg_peak_vram_gb") is not None:
-            lines.append(f"    Peak VRAM:        {s['avg_peak_vram_gb']:.2f} GB")
+        if s.get("avg_end_vram_gb") is not None:
+            lines.append(f"    End VRAM:         {s['avg_end_vram_gb']:.2f} GB")
         if s.get("avg_kv_cache_gb") is not None:
             lines.append(f"    KV cache:         {s['avg_kv_cache_gb']:.4f} GB")
         lines.append("")
@@ -286,31 +290,37 @@ def _generate_plots(logs: List[dict], output_dir: str, ts: str):
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # Plot 2: Peak VRAM vs context length
+        # Plot 2: End-of-generation VRAM vs context length
+        # End VRAM = model weights + KV cache (activations freed).
+        # This is the metric that shows TurboQuant's memory savings.
         ax = axes[0, 1]
         speed_data = sorted(get_results_by_test(log, "speed"), key=lambda r: r["context_length"])
         if speed_data:
             xs = [r["context_length"] for r in speed_data]
-            ys = [r["avg_peak_vram_gb"] for r in speed_data if r.get("avg_peak_vram_gb")]
-            if ys:
-                ax.plot(xs[:len(ys)], ys, marker="s", label=label, color=color)
-        ax.set_title("Peak VRAM vs Context Length")
+            ys = [r.get("avg_end_vram_gb") or r.get("avg_peak_vram_gb") for r in speed_data]
+            ys_clean = [(x, y) for x, y in zip(xs, ys) if y is not None]
+            if ys_clean:
+                ax.plot([p[0] for p in ys_clean], [p[1] for p in ys_clean],
+                        marker="s", label=label, color=color)
+        ax.set_title("End VRAM vs Context Length\n(model + KV cache after generation)")
         ax.set_xlabel("Context Length (tokens)")
         ax.set_ylabel("VRAM (GB)")
         ax.axhline(y=12, color="red", linestyle="--", alpha=0.5, label="12GB limit")
         ax.legend()
         ax.grid(True, alpha=0.3)
 
-        # Plot 3: Tokens/sec vs context length
+        # Plot 3: Decode tokens/sec vs context length
         ax = axes[1, 0]
         if speed_data:
             xs = [r["context_length"] for r in speed_data]
-            ys = [r["avg_tokens_per_sec"] for r in speed_data if r.get("avg_tokens_per_sec")]
-            if ys:
-                ax.plot(xs[:len(ys)], ys, marker="^", label=label, color=color)
-        ax.set_title("Tokens/sec vs Context Length")
+            ys = [r.get("avg_decode_tps") or r.get("avg_tokens_per_sec") for r in speed_data]
+            ys_clean = [(x, y) for x, y in zip(xs, ys) if y is not None]
+            if ys_clean:
+                ax.plot([p[0] for p in ys_clean], [p[1] for p in ys_clean],
+                        marker="^", label=label, color=color)
+        ax.set_title("Decode Tokens/sec vs Context Length")
         ax.set_xlabel("Context Length (tokens)")
-        ax.set_ylabel("Tokens/sec")
+        ax.set_ylabel("Decode Tokens/sec")
         ax.legend()
         ax.grid(True, alpha=0.3)
 

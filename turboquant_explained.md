@@ -85,30 +85,37 @@ So TurboQuant is within a factor of **2.72× of the theoretical best possible qu
 
 All paper results on Llama-3.1-8B-Instruct. Our reproduction runs on Llama-3.2-3B-Instruct (RTX 5070 12GB) — see [README](README.md) for our benchmark numbers.
 
-### KV Cache Compression (Needle-in-a-Haystack)
-| Method | Recall Score | Compression |
-|--------|-------------|-------------|
-| Full cache (fp16) | 1.000 | 1× |
-| SnapKV | 0.858 | 4× |
-| KIVI | 0.981 | 4× |
-| PolarQuant | 0.995 | 4× |
-| **TurboQuant** | **0.997** | **4×** |
+> **Important:** the paper ran on hardware with ample VRAM (A100/H100 class). Their benchmark compares KV cache sizes during long generation where the cache — not prefill activations — is the bottleneck. See the section above for why this matters on a 12 GB GPU.
 
-### LongBench (diverse long-context tasks)
-| Method | Avg Score | Bits/element |
-|--------|-----------|-------------|
-| Full cache | 50.06 | 16 |
-| TurboQuant | **50.06** | **3.5** |
-| TurboQuant (mixed) | 49.44 | 2.5 |
+### Needle-in-a-Haystack (recall quality under compression)
+| Method | Recall Score | Bits/element | Compression vs fp16 |
+|--------|-------------|-------------|---------------------|
+| Full cache (fp16) | 1.000 | 16 | 1× |
+| SnapKV (eviction) | 0.858 | — | 4× |
+| KIVI | 0.981 | 4 | 4× |
+| PolarQuant | 0.995 | 4 | 4× |
+| **TurboQuant** | **0.997** | **4** | **4×** |
 
-**Zero quality loss at 3.5 bits** — a 4.6× compression over fp16.
+TurboQuant has the highest recall among compressed methods at the same compression ratio.
 
-### Indexing Speed
-TurboQuant: 0.001–0.002 seconds
-Product Quantization: 37–494 seconds
-RabitQ: 597–3957 seconds
+### LongBench (diverse long-context language tasks)
+| Method | Avg Score | Bits/element | Compression vs fp16 |
+|--------|-----------|-------------|---------------------|
+| Full cache (fp16) | 50.06 | 16 | 1× |
+| **TurboQuant** | **50.06** | **3.5** | **4.6×** |
+| TurboQuant (mixed) | 49.44 | 2.5 | 6.4× |
 
-TurboQuant is **~100,000× faster to index** than competitors.
+**Zero quality loss at 3.5 bits per element** — a 4.6× compression over fp16.
+At 2.5 bits only a small quality drop (−0.62 avg score).
+
+### Indexing Speed (time to build the quantized index)
+| Method | Time |
+|--------|------|
+| **TurboQuant** | **0.001–0.002 s** |
+| Product Quantization | 37–494 s |
+| RabitQ | 597–3957 s |
+
+TurboQuant is **~100,000× faster to index** than competitors — critical for online/streaming inference where the cache is built token by token.
 
 ---
 
@@ -129,6 +136,42 @@ This is the key insight that makes TurboQuant **data-oblivious** and **online**:
 - It's not model quantization (it doesn't touch model weights)
 - It's not pruning or sparse attention
 - It is specifically a **KV cache compression** method applied during inference
+
+---
+
+## What TurboQuant Does NOT Fix: Prefill Memory
+
+This is the most important practical constraint to understand when running benchmarks.
+
+LLM inference has two distinct phases:
+
+```
+Phase 1 — PREFILL (prompt processing)
+  Input: all N prompt tokens at once
+  Memory: O(N²) per layer for attention scores + activations
+  TurboQuant: does NOT help here
+
+Phase 2 — DECODE (autoregressive generation)
+  Input: one new token at a time, attending over all past tokens
+  Memory: O(N) for the stored KV cache (grows with each new token)
+  TurboQuant: compresses this cache by 4–5×
+```
+
+During prefill, each attention layer must materialise the full Q @ Kᵀ matrix — e.g., for 8 192 tokens with 8 heads at fp16, that's ~1 GB **per layer** × 28 layers. This happens regardless of how the cache is stored afterwards.
+
+### Why 8 192 tokens is excluded from the benchmark
+
+On a 12 GB GPU (RTX 5070):
+
+| Phase | 4 096 tokens | 8 192 tokens |
+|-------|-------------|-------------|
+| Prefill peak VRAM | ~11 GB (fits) | ~22 GB (overflows to system RAM) |
+| Decode KV cache (fp16) | ~0.45 GB | ~0.9 GB |
+| Decode KV cache (4-bit) | ~0.11 GB | ~0.22 GB |
+
+At 8 192 tokens, the prefill overflow dominates everything — both modes spill to system RAM and become equally slow (~150s/trial). That comparison measures Windows WDDM paging behavior, not KV cache compression.
+
+The correct comparison: prefill ≤ 4 096 tokens (fits cleanly in VRAM) + generate 512+ new tokens (KV cache grows large enough to show savings). The metric that reflects the paper's contribution is **end-of-generation VRAM** (model weights + accumulated KV cache, activations freed) — not peak VRAM during prefill.
 
 ---
 
