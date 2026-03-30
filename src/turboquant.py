@@ -16,6 +16,14 @@ import numpy as np
 from scipy.optimize import brentq
 from typing import Tuple, Optional
 
+# Optional Triton kernels — used when available (CUDA only, bits in {1,2,4,8}).
+# Falls back to pure PyTorch for CPU, 3-bit, or when triton-windows is not installed.
+try:
+    from .triton_kernels import turboquant_quantize_and_pack, turboquant_unpack_and_lookup
+    _TRITON_AVAILABLE = True
+except ImportError:
+    _TRITON_AVAILABLE = False
+
 
 # ---------------------------------------------------------------------------
 # Index packing / unpacking
@@ -253,9 +261,14 @@ class TurboQuantMSE:
         scale = math.sqrt(self.rht.padded_dim)
         x_scaled = x_rot * scale
 
-        diff = x_scaled.unsqueeze(-1) - self.centroids               # (..., padded_dim, n_levels)
-        indices = diff.abs().argmin(dim=-1)                          # (..., padded_dim) int64
-        packed = pack_indices(indices, self.bits)                     # (..., packed_dim) uint8
+        if _TRITON_AVAILABLE and x_scaled.is_cuda and self.bits != 3:
+            # Fused argmin + pack — no intermediate (..., D, n_levels) tensor
+            packed = turboquant_quantize_and_pack(x_scaled, self.centroids, self.bits)
+        else:
+            # Pure PyTorch fallback (CPU, 3-bit, or Triton unavailable)
+            diff = x_scaled.unsqueeze(-1) - self.centroids           # (..., padded_dim, n_levels)
+            indices = diff.abs().argmin(dim=-1)                      # (..., padded_dim) int64
+            packed = pack_indices(indices, self.bits)                 # (..., packed_dim) uint8
         return packed, norms
 
     def dequantize(self, packed: torch.Tensor, norms: torch.Tensor) -> torch.Tensor:
@@ -267,8 +280,15 @@ class TurboQuantMSE:
         Returns:
             x_hat: float tensor (..., dim)
         """
-        indices = unpack_indices(packed, self.bits, self.rht.padded_dim)  # (..., padded_dim)
-        x_scaled = self.centroids[indices.long()]  # (..., padded_dim)
+        if _TRITON_AVAILABLE and packed.is_cuda and self.bits != 3:
+            # Fused unpack + centroid lookup — no temporary int16 indices tensor
+            x_scaled = turboquant_unpack_and_lookup(
+                packed, self.centroids, self.bits, self.rht.padded_dim
+            )
+        else:
+            # Pure PyTorch fallback
+            indices = unpack_indices(packed, self.bits, self.rht.padded_dim)  # (..., padded_dim)
+            x_scaled = self.centroids[indices.long()]  # (..., padded_dim)
 
         # Undo scaling
         scale = math.sqrt(self.rht.padded_dim)
